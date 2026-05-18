@@ -25,6 +25,10 @@ class Settings(BaseSettings):
 
     CLOUDKRAFT_IAM_ARN: str = "arn:aws:iam::REPLACE_WITH_YOUR_ACCOUNT_ID:user/cloudkraft"
 
+    ANTHROPIC_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+
     COOKIE_SECURE: bool = False
 
     # Terraform remote state (S3 + DynamoDB).

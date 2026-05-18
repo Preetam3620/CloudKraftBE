@@ -10,7 +10,7 @@ from sqlalchemy import inspect, text
 from app.config import settings
 from app.database import engine, Base
 from app import models
-from app.api import auth, workflows, codegen, validation, ai, deploy
+from app.api import auth, workflows, codegen, validation, ai, deploy, chat
 from app.limiter import limiter
 from app.services.terraform_runner import prewarm_plugin_cache
 from app.services.workspace_cleanup import cleanup_stale_workspaces
@@ -29,6 +29,8 @@ def _run_column_migrations() -> None:
             ("external_id",       "TEXT"),
             ("anthropic_api_key", "TEXT"),
             ("credential_salt",   "VARCHAR"),
+            ("openai_api_key",    "TEXT"),
+            ("gemini_api_key",    "TEXT"),
         ]
         for col, col_type in new_user_cols:
             if col not in user_cols:
@@ -95,6 +97,7 @@ app.include_router(codegen.router)
 app.include_router(validation.router)
 app.include_router(ai.router)
 app.include_router(deploy.router)
+app.include_router(chat.router)
 
 
 @app.get("/")

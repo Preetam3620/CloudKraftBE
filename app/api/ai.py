@@ -1,12 +1,12 @@
 import json
 import logging
-import os
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.api.auth import get_current_user
+from app.config import settings
 from app.limiter import limiter
 from app.models.user import User
 from app.utils.security import decrypt_aws_credentials
@@ -115,7 +115,7 @@ async def generate_architecture(
         except Exception:
             pass
     if not api_key:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = settings.ANTHROPIC_API_KEY
     if not api_key:
         raise HTTPException(
             status_code=503,
