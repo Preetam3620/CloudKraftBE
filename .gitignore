@@ -61,3 +61,6 @@ app/data/workspaces/
 
 # Claude Code memory
 .claude/
+
+# Local feature/design docs
+feature_*.md

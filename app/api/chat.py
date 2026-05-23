@@ -28,7 +28,12 @@ from app.schemas.chat import (
     ChatSessionCreate, ChatSessionResponse,
     ChatHistoryResponse, ChatMessageRequest,
 )
-from app.services.chat_graph import build_graph, stream_response, seed_memory_from_history, is_thread_seeded
+from app.config import settings
+from app.services.ai_prompts import WORKFLOW_EDIT_PROMPT
+from app.services.chat_graph import (
+    build_graph, stream_response, seed_memory_from_history, is_thread_seeded,
+    _PROVIDER_DEFAULTS,
+)
 from app.utils.security import decode_access_token, is_token_revoked, decrypt_aws_credentials
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,14 @@ async def _seed_session_memory(session: ChatSession, thread_id: str, db: Session
         db_messages = _get_session_messages(session.id, db)
         if db_messages:
             await seed_memory_from_history(thread_id, db_messages)
+
+
+def _record_user_message(db: Session, session: ChatSession, session_id: int, text: str) -> None:
+    db.add(ChatMessage(session_id=session_id, role="user", content=text))
+    if not session.title:
+        session.title = text[:60]
+    session.updated_at = datetime.now(timezone.utc)
+    db.commit()
 
 
 @router.post("/sessions", response_model=ChatSessionResponse, status_code=201)
@@ -181,15 +194,8 @@ async def send_message(
 
     thread_id = str(session_id)
 
-    # Only hit the DB if LangGraph memory lost this thread's history (e.g. after restart)
-    if not await is_thread_seeded(thread_id):
-        await seed_memory_from_history(thread_id, _get_session_messages(session_id, db))
-
-    db.add(ChatMessage(session_id=session_id, role="user", content=body.message))
-    if not s.title:
-        s.title = body.message[:60]
-    s.updated_at = datetime.now(timezone.utc)
-    db.commit()
+    await _seed_session_memory(s, thread_id, db)
+    _record_user_message(db, s, session_id, body.message)
 
     user_message = body.message
 
@@ -264,11 +270,25 @@ async def chat_ws(
                 user_text = str(data.get("message", "")).strip()
                 msg_provider = (data.get("llm_provider") or "").strip() or session.llm_provider
                 msg_model = (data.get("llm_model") or "").strip() or session.llm_model
+                edit_mode    = bool(data.get("edit_mode", False))
+                canvas_state = data.get("canvas_state")
             except (json.JSONDecodeError, AttributeError):
                 await websocket.send_json({"type": "error", "detail": "Invalid JSON"})
                 continue
 
             if not user_text:
+                continue
+
+            if len(user_text) > 3000:
+                await websocket.send_json({"type": "error", "detail": "message cannot exceed 3000 characters"})
+                continue
+
+            if edit_mode and canvas_state is not None:
+                await _handle_edit_mode(
+                    websocket, db, session, session_id, user, user_text, canvas_state,
+                    provider=msg_provider,
+                    model=msg_model,
+                )
                 continue
 
             if msg_provider not in _PROVIDER_KEY_FIELD:
@@ -284,11 +304,7 @@ async def chat_ws(
                     await websocket.send_json({"type": "error", "detail": str(exc)})
                     continue
 
-            db.add(ChatMessage(session_id=session_id, role="user", content=user_text))
-            if not session.title:
-                session.title = user_text[:60]
-            session.updated_at = datetime.now(timezone.utc)
-            db.commit()
+            _record_user_message(db, session, session_id, user_text)
 
             chunks: list[str] = []
             try:
@@ -311,3 +327,124 @@ async def chat_ws(
         logger.info("Chat WS disconnected session=%d user=%d", session_id, user.id)
     except Exception:
         logger.exception("Unexpected WS error session=%d", session_id)
+
+
+def _call_provider_for_edit(
+    provider: str,
+    model: str,
+    api_key: str,
+    history: list[dict],
+    system_prompt: str,
+) -> str:
+    """Single non-streaming structured call to the configured LLM. Returns raw text."""
+
+    if provider == "claude":
+        from anthropic import Anthropic
+        resp = Anthropic(api_key=api_key).messages.create(
+            model=model, max_tokens=4096, system=system_prompt, messages=history,
+        )
+        return resp.content[0].text.strip()
+
+    elif provider == "openai":
+        from openai import OpenAI
+        msgs = [{"role": "system", "content": system_prompt}] + history
+        resp = OpenAI(api_key=api_key).chat.completions.create(
+            model=model, max_tokens=4096, messages=msgs,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    elif provider == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        # Gemini roles: "assistant" → "model"; split history so last turn goes via send_message
+        gemini_history = [
+            {"role": "model" if m["role"] == "assistant" else "user", "parts": [m["content"]]}
+            for m in history[:-1]
+        ]
+        last_msg = history[-1]["content"]
+        chat = genai.GenerativeModel(
+            model_name=model, system_instruction=system_prompt
+        ).start_chat(history=gemini_history)
+        return chat.send_message(last_msg).text.strip()
+
+    raise ValueError(f"Unknown provider: {provider!r}")
+
+
+async def _handle_edit_mode(
+    websocket: WebSocket,
+    db: Session,
+    session: ChatSession,
+    session_id: int,
+    user: User,
+    user_text: str,
+    canvas_state: dict,
+    provider: str = "claude",
+    model: Optional[str] = None,
+) -> None:
+    # 1. Persist user message (text only — keeps history readable)
+    _record_user_message(db, session, session_id, user_text)
+
+    # 2. Build conversation history from all prior messages
+    prior = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.id.asc())
+        .all()
+    )
+    history = [{"role": m.role, "content": m.content} for m in prior if m.content]
+
+    # 3. Append current request with canvas context as the final user turn
+    history.append({
+        "role": "user",
+        "content": (
+            f"Current canvas state:\n{json.dumps(canvas_state, separators=(',', ':'))}\n\n"
+            f"User request: {user_text}"
+        ),
+    })
+
+    # 4. Resolve API key for the session's provider (user key first, env fallback)
+    resolved_model = (model or "").strip() or _PROVIDER_DEFAULTS.get(provider, "claude-sonnet-4-6")
+    encrypted = getattr(user, _PROVIDER_KEY_FIELD.get(provider, ""), None)
+    env_attr = _PROVIDER_KEY_FIELD.get(provider, "").upper()
+    api_key = _decrypt_key(encrypted, user) or getattr(settings, env_attr, "")
+    if not api_key:
+        await websocket.send_json({"type": "error", "detail": f"No API key configured for provider: {provider}"})
+        return
+
+    # 5. Call the provider directly (not LangGraph — we need one structured JSON response)
+    try:
+        raw = _call_provider_for_edit(provider, resolved_model, api_key, history, WORKFLOW_EDIT_PROMPT)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "detail": f"AI call failed: {exc}"})
+        return
+
+    # 6. Strip markdown fences if the model wrapped the JSON
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    if raw.endswith("```"):
+        raw = raw[: raw.rfind("```")].strip()
+
+    # 7. Parse and validate
+    try:
+        result = json.loads(raw)
+        summary        = result.get("summary", "Workflow updated.")
+        workflow_state = result.get("workflow_state", {})
+        if "nodes" not in workflow_state:
+            raise ValueError("missing 'nodes'")
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "detail": f"Invalid AI response: {exc}"})
+        return
+
+    # 8. Persist assistant summary (not the full JSON)
+    db.add(ChatMessage(session_id=session_id, role="assistant", content=summary))
+    db.commit()
+
+    # 9. Send proposal to frontend
+    await websocket.send_json({
+        "type": "workflow_proposal",
+        "summary": summary,
+        "workflow_state": workflow_state,
+    })
