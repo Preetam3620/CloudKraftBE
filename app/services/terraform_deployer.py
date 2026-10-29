@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
+from app.config import RUNTIME_DATA_DIR
 from app.database import SessionLocal
 from app.models.deployment import Deployment, DeploymentLog
 from app.schemas.workflow import WorkflowState
@@ -21,7 +22,7 @@ from app.utils.security import decrypt_aws_credentials
 
 logger = logging.getLogger(__name__)
 
-WORKSPACES_DIR = Path(__file__).parent.parent / "data" / "workspaces"
+WORKSPACES_DIR = RUNTIME_DATA_DIR / "workspaces"
 
 _SENSITIVE_PATTERNS = [
     (re.compile(r'\b(AKIA|ASIA)[A-Z0-9]{16}\b'), "***AWS_KEY***"),

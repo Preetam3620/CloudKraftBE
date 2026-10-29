@@ -1,0 +1,20 @@
+# Keep the function bundle small (Python functions are not tree-shaken)
+venv/
+.venv/
+**/__pycache__/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+.vscode/
+.claude/
+bin/
+app/data/terraform_plugin_cache/
+app/data/terraform_warm_workspace/
+app/data/workspaces/
+alembic/
+alembic.ini
+scripts/
+*.md
+render.yaml

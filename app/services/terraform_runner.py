@@ -25,15 +25,16 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.config import RUNTIME_DATA_DIR
 from app.schemas.codegen import ValidationError
 
 logger = logging.getLogger(__name__)
 
 # Persistent plugin cache — provider binaries live here after first download
-PLUGIN_CACHE_DIR = Path(__file__).parent.parent / "data" / "terraform_plugin_cache"
+PLUGIN_CACHE_DIR = RUNTIME_DATA_DIR / "terraform_plugin_cache"
 
 # Pre-initialised workspace — .terraform/ is copied from here for each validation
-WARM_WORKSPACE_DIR = Path(__file__).parent.parent / "data" / "terraform_warm_workspace"
+WARM_WORKSPACE_DIR = RUNTIME_DATA_DIR / "terraform_warm_workspace"
 
 # Minimal config that pulls in the AWS provider (same major version users get)
 _MINIMAL_VERSIONS_TF = """\

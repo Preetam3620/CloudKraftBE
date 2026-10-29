@@ -111,6 +111,10 @@ async def seed_memory_from_history(thread_id: str, db_messages: list) -> None:
         logger.debug("Seeded %d messages into thread_id=%s", len(lc_messages), thread_id)
 
 
+async def forget_thread(thread_id: str) -> None:
+    await _memory.adelete_thread(thread_id)
+
+
 async def stream_response(
     graph,
     user_message: str,

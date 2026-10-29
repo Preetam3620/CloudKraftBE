@@ -47,6 +47,8 @@ class ChatHistoryResponse(BaseModel):
 
 class ChatMessageRequest(_ProviderBase):
     message: str
+    edit_mode: bool = False
+    canvas_state: Optional[dict] = None
 
     @field_validator("message")
     @classmethod

@@ -9,6 +9,7 @@ cannot send custom headers.
 """
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -32,7 +33,7 @@ from app.config import settings
 from app.services.ai_prompts import WORKFLOW_EDIT_PROMPT
 from app.services.chat_graph import (
     build_graph, stream_response, seed_memory_from_history, is_thread_seeded,
-    _PROVIDER_DEFAULTS,
+    forget_thread, _PROVIDER_DEFAULTS,
 )
 from app.utils.security import decode_access_token, is_token_revoked, decrypt_aws_credentials
 
@@ -183,16 +184,36 @@ async def send_message(
     Stream a chat response as Server-Sent Events (text/event-stream).
 
     Events: `{"type":"token","content":"..."}` ... `{"type":"done"}`
+    Edit mode (`edit_mode` + `canvas_state`): a single `{"type":"workflow_proposal",...}`
     On error: `{"type":"error","detail":"..."}`
+
+    Stateless so it works on serverless hosts (Vercel has no WebSockets): every
+    request rebuilds the conversation from the DB into a throwaway LangGraph
+    thread, since the next message may land on an instance that never saw it.
     """
     s = _get_owned(session_id, current_user.id, db)
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+    def sse(event: dict) -> str:
+        return f"data: {json.dumps(event)}\n\n"
+
+    if body.edit_mode and body.canvas_state is not None:
+        event = await _run_edit_mode(
+            db, s, session_id, current_user, body.message, body.canvas_state,
+            provider=body.llm_provider, model=body.llm_model,
+        )
+
+        async def generate_edit():
+            yield sse(event)
+
+        return StreamingResponse(generate_edit(), media_type="text/event-stream", headers=sse_headers)
 
     try:
         graph = _resolve_graph(body.llm_provider, body.llm_model, current_user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    thread_id = str(session_id)
+    thread_id = f"{session_id}-{uuid.uuid4().hex}"
 
     await _seed_session_memory(s, thread_id, db)
     _record_user_message(db, s, session_id, body.message)
@@ -204,24 +225,22 @@ async def send_message(
         try:
             async for chunk in stream_response(graph, user_message, thread_id):
                 chunks.append(chunk)
-                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+                yield sse({"type": "token", "content": chunk})
         except Exception as exc:
             logger.exception("LLM stream error session=%d", session_id)
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+            yield sse({"type": "error", "detail": str(exc)})
             return
+        finally:
+            await forget_thread(thread_id)
 
         full = "".join(chunks)
         if full:
             db.add(ChatMessage(session_id=session_id, role="assistant", content=full))
             db.commit()
 
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        yield sse({"type": "done"})
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(generate(), media_type="text/event-stream", headers=sse_headers)
 
 
 @router.websocket("/ws/{session_id}")
@@ -284,11 +303,12 @@ async def chat_ws(
                 continue
 
             if edit_mode and canvas_state is not None:
-                await _handle_edit_mode(
-                    websocket, db, session, session_id, user, user_text, canvas_state,
+                event = await _run_edit_mode(
+                    db, session, session_id, user, user_text, canvas_state,
                     provider=msg_provider,
                     model=msg_model,
                 )
+                await websocket.send_json(event)
                 continue
 
             if msg_provider not in _PROVIDER_KEY_FIELD:
@@ -370,8 +390,7 @@ def _call_provider_for_edit(
     raise ValueError(f"Unknown provider: {provider!r}")
 
 
-async def _handle_edit_mode(
-    websocket: WebSocket,
+async def _run_edit_mode(
     db: Session,
     session: ChatSession,
     session_id: int,
@@ -380,7 +399,8 @@ async def _handle_edit_mode(
     canvas_state: dict,
     provider: str = "claude",
     model: Optional[str] = None,
-) -> None:
+) -> dict:
+    """Ask the LLM for an edited canvas; returns the event to send (proposal or error)."""
     # 1. Persist user message (text only — keeps history readable)
     _record_user_message(db, session, session_id, user_text)
 
@@ -408,15 +428,13 @@ async def _handle_edit_mode(
     env_attr = _PROVIDER_KEY_FIELD.get(provider, "").upper()
     api_key = _decrypt_key(encrypted, user) or getattr(settings, env_attr, "")
     if not api_key:
-        await websocket.send_json({"type": "error", "detail": f"No API key configured for provider: {provider}"})
-        return
+        return {"type": "error", "detail": f"No API key configured for provider: {provider}"}
 
     # 5. Call the provider directly (not LangGraph — we need one structured JSON response)
     try:
         raw = _call_provider_for_edit(provider, resolved_model, api_key, history, WORKFLOW_EDIT_PROMPT)
     except Exception as exc:
-        await websocket.send_json({"type": "error", "detail": f"AI call failed: {exc}"})
-        return
+        return {"type": "error", "detail": f"AI call failed: {exc}"}
 
     # 6. Strip markdown fences if the model wrapped the JSON
     if raw.startswith("```"):
@@ -435,16 +453,15 @@ async def _handle_edit_mode(
         if "nodes" not in workflow_state:
             raise ValueError("missing 'nodes'")
     except Exception as exc:
-        await websocket.send_json({"type": "error", "detail": f"Invalid AI response: {exc}"})
-        return
+        return {"type": "error", "detail": f"Invalid AI response: {exc}"}
 
     # 8. Persist assistant summary (not the full JSON)
     db.add(ChatMessage(session_id=session_id, role="assistant", content=summary))
     db.commit()
 
-    # 9. Send proposal to frontend
-    await websocket.send_json({
+    # 9. Proposal for the frontend
+    return {
         "type": "workflow_proposal",
         "summary": summary,
         "workflow_state": workflow_state,
-    })
+    }

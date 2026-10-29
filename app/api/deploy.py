@@ -20,10 +20,20 @@ from app.schemas.deployment import (
 )
 from app.schemas.workflow import WorkflowState
 from app.services.terraform_deployer import run_deployment, run_destroy, run_plan, run_apply_planned
+from app.services.terraform_runner import is_terraform_available
 
 router = APIRouter(prefix="/api/deploy", tags=["deployment"])
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "destroyed"}
+
+
+def _require_terraform() -> None:
+    """Refuse to queue work the server can't run (e.g. on Vercel, which has no terraform binary)."""
+    if not is_terraform_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Deployments are unavailable on this server: the terraform binary is not installed.",
+        )
 
 
 def _to_response(d: Deployment) -> DeploymentResponse:
@@ -51,7 +61,8 @@ def _write_audit(db: Session, action: str, user_id: int, resource_id=None, ip=No
     db.commit()
 
 
-@router.post("/plan", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/plan", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_require_terraform)])
 @limiter.limit("5/minute")
 async def deploy_plan(
     request: Request,
@@ -105,7 +116,8 @@ async def deploy_plan(
     return _to_response(deployment)
 
 
-@router.post("/{deployment_id}/approve", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{deployment_id}/approve", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_require_terraform)])
 @limiter.limit("5/minute")
 async def approve_deployment(
     request: Request,
@@ -136,7 +148,8 @@ async def approve_deployment(
     return _to_response(deployment)
 
 
-@router.post("/apply", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/apply", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_require_terraform)])
 @limiter.limit("5/minute")
 async def deploy_apply(
     request: Request,
@@ -260,7 +273,8 @@ def get_deployment_logs(
 # ---------------------------------------------------------------------------
 
 @router.post("/{deployment_id}/destroy", response_model=DeploymentResponse,
-             status_code=status.HTTP_202_ACCEPTED)
+             status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_require_terraform)])
 @limiter.limit("10/minute")
 async def destroy_deployment(
     request: Request,
@@ -294,7 +308,8 @@ async def destroy_deployment(
     return _to_response(deployment)
 
 
-@router.post("/destroy-all", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/destroy-all", status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_require_terraform)])
 @limiter.limit("3/minute")
 async def destroy_all_deployments(
     request: Request,

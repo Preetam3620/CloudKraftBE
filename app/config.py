@@ -1,6 +1,16 @@
+import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 from typing import List, Union
+
+# Vercel sets VERCEL=1 in every build and function. Its filesystem is read-only
+# except /tmp, and nothing written there survives between invocations.
+IS_VERCEL = bool(os.getenv("VERCEL"))
+
+# Writable directory for Terraform caches and per-deployment workspaces.
+RUNTIME_DATA_DIR = Path("/tmp/cloudkraft") if IS_VERCEL else Path(__file__).parent / "data"
 
 
 class Settings(BaseSettings):
@@ -37,6 +47,14 @@ class Settings(BaseSettings):
     TF_STATE_LOCK_TABLE: str = ""
     TF_STATE_REGION: str = "us-east-1"
     
+    @field_validator('DATABASE_URL', mode='before')
+    @classmethod
+    def normalize_database_url(cls, v: str) -> str:
+        # Neon / Vercel Postgres hand out postgres:// URLs; SQLAlchemy 2.x only accepts postgresql://
+        if isinstance(v, str) and v.startswith("postgres://"):
+            return "postgresql://" + v[len("postgres://"):]
+        return v
+
     @field_validator('CORS_ORIGINS', mode='before')
     @classmethod
     def parse_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
